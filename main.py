@@ -1,6 +1,6 @@
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters, PreCheckoutQueryHandler
 from datetime import datetime, timedelta
 import json
 import os
@@ -24,7 +24,7 @@ DATA_FILE = "users_data.json"
 
 # Стандартні значення
 DEFAULT_BALANCE = 0
-STARS_TO_HELPCOINS = 1
+STARS_TO_HELPCOINS = 100  # 1 зірка = 100 HelpCoins
 GENERATOR_COST = 18000
 PLUS_COST = 500000
 PLUS_DURATION = 5  # днів
@@ -104,6 +104,11 @@ def get_main_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
+def get_back_keyboard():
+    """Повертає кнопку назад"""
+    keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]]
+    return InlineKeyboardMarkup(keyboard)
+
 # Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -151,7 +156,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_generator and not has_plus:
         keyboard = [
             [InlineKeyboardButton(f"🎯 Generator - {GENERATOR_COST:,} HelpCoins", callback_data="buy_generator_direct")],
-            [InlineKeyboardButton(f"💎 Plus - {PLUS_COST:,} HelpCoins", callback_data="buy_plus_direct")]
+            [InlineKeyboardButton(f"💎 Plus - {PLUS_COST:,} HelpCoins", callback_data="buy_plus_direct")],
+            [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
@@ -174,6 +180,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Редагування повідомлення з відповіддю
         keyboard = [
+            [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
             [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -461,6 +468,56 @@ async def helpplus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text("✅ У вас постійна підписка Plus!")
 
+# Обробка платежів зірками
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Відповідь на попередню перевірку платежу"""
+    query = update.pre_checkout_query
+    # Відповіді "OK" на попередню перевірку
+    await query.answer(ok=True)
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обробка успішного платежу зірками"""
+    user_id = update.effective_user.id
+    user = user_data.get_user(user_id)
+    
+    # Отримуємо кількість зірок
+    payload = update.message.successful_payment.invoice_payload
+    
+    if payload == "buy_stars_1":
+        # 1 зірка = 100 HelpCoins
+        stars_amount = 1
+        helpcoins = STARS_TO_HELPCOINS
+    elif payload == "buy_stars_5":
+        # 5 зірок = 500 HelpCoins
+        stars_amount = 5
+        helpcoins = STARS_TO_HELPCOINS * 5
+    elif payload == "buy_stars_10":
+        # 10 зірок = 1000 HelpCoins
+        stars_amount = 10
+        helpcoins = STARS_TO_HELPCOINS * 10
+    else:
+        stars_amount = 1
+        helpcoins = STARS_TO_HELPCOINS
+    
+    # Додаємо баланс
+    user["balance"] += helpcoins
+    user["stars"] += stars_amount
+    user_data.save_data()
+    
+    keyboard = [
+        [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+        [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"✅ Платіж успішно оброблено!\n\n"
+        f"⭐ Отримано зірок: {stars_amount}\n"
+        f"💰 Отримано HelpCoins: {helpcoins:,}\n"
+        f"💵 Новий баланс: {user['balance']:,} HelpCoins",
+        reply_markup=reply_markup
+    )
+
 # Функція пошуку користувача
 def find_user_id(identifier):
     """Пошук ID користувача за username або ID"""
@@ -505,11 +562,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 has_plus = False
         
         if has_generator or has_plus:
-            await query.edit_message_text("💬 Напишіть своє запитання, і я вам відповім!\n\nПросто пишіть в чат 👇", reply_markup=get_main_keyboard())
+            keyboard = [
+                [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+                [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text("💬 Напишіть своє запитання, і я вам відповім!\n\nПросто пишіть в чат 👇", reply_markup=reply_markup)
         else:
             keyboard = [
                 [InlineKeyboardButton(f"🎯 Generator", callback_data="buy_generator_direct")],
                 [InlineKeyboardButton(f"💎 Plus", callback_data="buy_plus_direct")],
+                [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
                 [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -522,32 +585,43 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif query.data == "balance":
         user = user_data.get_user(query.from_user.id)
-        keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]]
+        keyboard = [
+            [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+            [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(f"💰 Ваш баланс: {user['balance']:,} HelpCoins", reply_markup=reply_markup)
     
     elif query.data == "exchange_stars":
         keyboard = [
-            [InlineKeyboardButton("⭐ Обміняти", callback_data="do_exchange")],
+            [InlineKeyboardButton("⭐ 1 зірка = 100 HelpCoins", callback_data="buy_stars_1")],
+            [InlineKeyboardButton("⭐ 5 зірок = 500 HelpCoins", callback_data="buy_stars_5")],
+            [InlineKeyboardButton("⭐ 10 зірок = 1000 HelpCoins", callback_data="buy_stars_10")],
+            [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
             [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
-            f"⭐ ОБМІН ЗІРОК\n\n"
-            f"Коефіцієнт: 1 ⭐ = {STARS_TO_HELPCOINS} HelpCoin\n\n"
-            f"Натисніть кнопку для обміну зірок на HelpCoins",
+            f"⭐ ОБМІН TELEGRAM ЗІРОК\n\n"
+            f"Оберіть кількість зірок для обміну:\n\n"
+            f"1 ⭐ = {STARS_TO_HELPCOINS} HelpCoins\n"
+            f"5 ⭐ = {STARS_TO_HELPCOINS * 5} HelpCoins\n"
+            f"10 ⭐ = {STARS_TO_HELPCOINS * 10} HelpCoins",
             reply_markup=reply_markup
         )
     
-    elif query.data == "do_exchange":
-        keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text("✅ Обмін зірок включено в підписці Generator", reply_markup=reply_markup)
+    elif query.data == "buy_stars_1":
+        await send_invoice(update, context, 1)
+    elif query.data == "buy_stars_5":
+        await send_invoice(update, context, 5)
+    elif query.data == "buy_stars_10":
+        await send_invoice(update, context, 10)
     
     elif query.data == "subscriptions":
         keyboard = [
             [InlineKeyboardButton("🎯 Generator", callback_data="sub_generator")],
             [InlineKeyboardButton("💎 Plus", callback_data="sub_plus")],
+            [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
             [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -560,16 +634,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if gen_type == "3d" and user.get("generator_expiry"):
                 expiry_date = datetime.fromisoformat(user["generator_expiry"])
                 days_left = (expiry_date - datetime.now()).days
-                keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="subscriptions")]]
+                keyboard = [
+                    [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+                    [InlineKeyboardButton("👈 Назад", callback_data="subscriptions")]
+                ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 await query.edit_message_text(f"✅ Ви маєте Generator!\n\n🎯 Тип: {gen_type}\nДнів залишилось: {days_left}", reply_markup=reply_markup)
             else:
-                keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="subscriptions")]]
+                keyboard = [
+                    [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+                    [InlineKeyboardButton("👈 Назад", callback_data="subscriptions")]
+                ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 await query.edit_message_text(f"✅ Ви маєте постійний Generator!", reply_markup=reply_markup)
         else:
             keyboard = [
                 [InlineKeyboardButton(f"🎯 Купити за {GENERATOR_COST:,} HelpCoins", callback_data="buy_generator_direct")],
+                [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
                 [InlineKeyboardButton("👈 Назад", callback_data="subscriptions")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -587,16 +668,23 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if expiry:
                 expiry_date = datetime.fromisoformat(expiry)
                 days_left = (expiry_date - datetime.now()).days
-                keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="subscriptions")]]
+                keyboard = [
+                    [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+                    [InlineKeyboardButton("👈 Назад", callback_data="subscriptions")]
+                ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 await query.edit_message_text(f"✅ Ви маєте Plus!\n\nДнів залишилось: {days_left}", reply_markup=reply_markup)
             else:
-                keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="subscriptions")]]
+                keyboard = [
+                    [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+                    [InlineKeyboardButton("👈 Назад", callback_data="subscriptions")]
+                ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 await query.edit_message_text("✅ Ви маєте постійний Plus!", reply_markup=reply_markup)
         else:
             keyboard = [
                 [InlineKeyboardButton(f"💎 Купити Plus за {PLUS_COST:,} HelpCoins", callback_data="buy_plus_direct")],
+                [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
                 [InlineKeyboardButton("👈 Назад", callback_data="subscriptions")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -616,11 +704,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user["generator_expiry"] = (datetime.now() + timedelta(days=3)).isoformat()
             user["balance"] -= GENERATOR_COST
             user_data.save_data()
-            keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]]
+            keyboard = [
+                [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+                [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
+            ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text("✅ Generator активовано на 3 дні!", reply_markup=reply_markup)
         else:
-            keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]]
+            keyboard = [
+                [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+                [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
+            ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(f"❌ Недостатньо коштів!\n\nПотрібно: {GENERATOR_COST:,} HelpCoins\nЄ: {user['balance']:,} HelpCoins", reply_markup=reply_markup)
     
@@ -632,11 +726,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user["generator_expiry"] = (datetime.now() + timedelta(days=3)).isoformat()
             user["balance"] -= GENERATOR_COST
             user_data.save_data()
-            keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]]
+            keyboard = [
+                [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+                [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
+            ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text("✅ Generator активовано на 3 дні!", reply_markup=reply_markup)
         else:
-            keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]]
+            keyboard = [
+                [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+                [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
+            ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(f"❌ Недостатньо коштів!\n\nПотрібно: {GENERATOR_COST:,} HelpCoins\nЄ: {user['balance']:,} HelpCoins", reply_markup=reply_markup)
     
@@ -647,11 +747,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user["plus_expiry"] = (datetime.now() + timedelta(days=PLUS_DURATION)).isoformat()
             user["balance"] -= PLUS_COST
             user_data.save_data()
-            keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]]
+            keyboard = [
+                [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+                [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
+            ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(f"✅ Plus активовано на {PLUS_DURATION} днів!", reply_markup=reply_markup)
         else:
-            keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]]
+            keyboard = [
+                [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+                [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
+            ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(f"❌ Недостатньо коштів!\n\nПотрібно: {PLUS_COST:,} HelpCoins\nЄ: {user['balance']:,} HelpCoins", reply_markup=reply_markup)
     
@@ -662,11 +768,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user["plus_expiry"] = (datetime.now() + timedelta(days=PLUS_DURATION)).isoformat()
             user["balance"] -= PLUS_COST
             user_data.save_data()
-            keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]]
+            keyboard = [
+                [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+                [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
+            ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(f"✅ Plus активовано на {PLUS_DURATION} днів!", reply_markup=reply_markup)
         else:
-            keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]]
+            keyboard = [
+                [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+                [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
+            ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(f"❌ Недостатньо коштів!\n\nПотрібно: {PLUS_COST:,} HelpCoins\nЄ: {user['balance']:,} HelpCoins", reply_markup=reply_markup)
     
@@ -675,7 +787,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         generator_status = "✅ Має" if user["has_generator"] else "❌ Немає"
         plus_status = "✅ Має" if user["has_plus"] else "❌ Немає"
         
-        keyboard = [[InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]]
+        keyboard = [
+            [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
+            [InlineKeyboardButton("👈 Назад", callback_data="back_to_menu")]
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
@@ -695,6 +810,36 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard()
         )
 
+async def send_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE, stars: int):
+    """Відправка інвойсу для покупки зірок"""
+    if stars == 1:
+        payload = "buy_stars_1"
+        title = "1 ⭐ Telegram Star"
+        description = "Купити 1 Telegram зірку"
+        price = 1  # 1 Telegram Star = 1 USD
+    elif stars == 5:
+        payload = "buy_stars_5"
+        title = "5 ⭐ Telegram Stars"
+        description = "Купити 5 Telegram зірок"
+        price = 5
+    elif stars == 10:
+        payload = "buy_stars_10"
+        title = "10 ⭐ Telegram Stars"
+        description = "Купити 10 Telegram зірок"
+        price = 10
+    else:
+        return
+    
+    await context.bot.send_invoice(
+        chat_id=update.callback_query.from_user.id,
+        title=title,
+        description=description,
+        payload=payload,
+        provider_token="",  # Залишити пусто - Telegram Stars не потребує provider_token
+        currency="XTR",  # XTR - валюта Telegram Stars
+        prices=[LabeledPrice(label=f"Buy {stars} ⭐", amount=stars)],
+    )
+
 def main():
     """Запуск бота"""
     app = Application.builder().token(BOT_TOKEN).build()
@@ -712,6 +857,10 @@ def main():
     
     # Обробка текстових повідомлень (запитання до AI)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Обробка платежів
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
     
     # Callback кнопки
     app.add_handler(CallbackQueryHandler(button_callback))
