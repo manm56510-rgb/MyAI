@@ -1,9 +1,10 @@
 import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from datetime import datetime, timedelta
 import json
 import os
+from transformers import pipeline
 
 # Налаштування логування
 logging.basicConfig(
@@ -27,6 +28,17 @@ STARS_TO_HELPCOINS = 1
 GENERATOR_COST = 18000
 PLUS_COST = 500000
 PLUS_DURATION = 5  # днів
+
+# Ініціалізація AI моделі
+print("⏳ Завантаження AI моделі... (перший запуск може тривати 1-2 хвилини)")
+try:
+    qa_pipeline = pipeline("question-answering", model="deepset/roberta-base-squad2")
+    text_generation = pipeline("text-generation", model="gpt2")
+    logger.info("✅ AI моделі успішно завантажені")
+except Exception as e:
+    logger.warning(f"⚠️ Помилка завантаження моделей: {e}")
+    qa_pipeline = None
+    text_generation = None
 
 class UserData:
     def __init__(self):
@@ -54,10 +66,12 @@ class UserData:
                 "stars": 0,
                 "has_generator": False,
                 "generator_type": None,  # "3d" або "permanent"
+                "generator_expiry": None,
                 "has_plus": False,
                 "plus_expiry": None,
                 "partner_enabled": False,
-                "earnings": 0
+                "earnings": 0,
+                "ai_requests": 0
             }
             self.save_data()
         return self.users[user_id_str]
@@ -85,6 +99,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data.set_username(user.id, user.username or user.first_name)
     
     keyboard = [
+        [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
         [InlineKeyboardButton("💰 Баланс", callback_data="balance")],
         [InlineKeyboardButton("⭐ Обміняти зірки", callback_data="exchange_stars")],
         [InlineKeyboardButton("🎁 Підписки", callback_data="subscriptions")],
@@ -95,9 +110,144 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🤖 Ласкаво просимо до {BOT_NAME}!\n\n"
         f"Компанія: {COMPANY_NAME}\n\n"
+        f"💬 Пишіть запитання - я відповім вам!\n\n"
         f"Оберіть опцію нижче:",
         reply_markup=reply_markup
     )
+
+# Обробка текстових повідомлень (запитання до AI)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = user_data.get_user(user_id)
+    question = update.message.text
+    
+    # Перевірка, чи користувач має доступ до AI
+    has_generator = user["has_generator"]
+    has_plus = user["has_plus"]
+    
+    # Перевірка терміну дії Generator
+    if has_generator and user.get("generator_type") == "3d":
+        expiry = user.get("generator_expiry")
+        if expiry:
+            expiry_date = datetime.fromisoformat(expiry)
+            if datetime.now() > expiry_date:
+                user["has_generator"] = False
+                user["generator_expiry"] = None
+                user_data.save_data()
+                has_generator = False
+    
+    # Перевірка терміну дії Plus
+    if has_plus and user.get("plus_expiry"):
+        expiry_date = datetime.fromisoformat(user["plus_expiry"])
+        if datetime.now() > expiry_date:
+            user["has_plus"] = False
+            user["plus_expiry"] = None
+            user_data.save_data()
+            has_plus = False
+    
+    # Якщо немає жодної підписки
+    if not has_generator and not has_plus:
+        keyboard = [
+            [InlineKeyboardButton(f"🎯 Generator", callback_data="buy_generator_direct")],
+            [InlineKeyboardButton(f"💎 Plus", callback_data="buy_plus_direct")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"❌ Потрібна підписка Generator або Plus для використання AI!\n\n"
+            f"🎯 Generator: {GENERATOR_COST:,} HelpCoins (на 3 дні)\n"
+            f"💎 Plus: {PLUS_COST:,} HelpCoins (на {PLUS_DURATION} днів)\n\n"
+            f"Оберіть підписку:",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Відправка повідомлення про обробку
+    processing_msg = await update.message.reply_text("⏳ Обробляю ваше запитання...")
+    
+    try:
+        # Генерування відповіді AI
+        response = generate_ai_response(question)
+        
+        # Збільшення лічильника запитань
+        user["ai_requests"] += 1
+        user_data.save_data()
+        
+        # Редагування повідомлення з відповіддю
+        await processing_msg.edit_text(
+            f"🤖 <b>Відповідь AI:</b>\n\n"
+            f"{response}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.error(f"Помилка при обробці запитання: {e}")
+        await processing_msg.edit_text(
+            f"❌ Помилка при обробці запитання.\n\n"
+            f"Спробуйте пізніше або скоротіть запитання."
+        )
+
+def generate_ai_response(question):
+    """Генерування відповіді на запитання"""
+    try:
+        # Спроба використати модель для відповідей на запитання
+        if qa_pipeline:
+            # Контекст для відповідей
+            context = f"""
+            Це штучний інтелект для Telegram бота Ukrainian Helper компанії UkraineAI.
+            Відповідай коротко і по суті українською мовою.
+            {question}
+            """
+            
+            try:
+                result = qa_pipeline(question=question, context=context)
+                answer = result.get('answer', '')
+                if answer:
+                    return f"{answer}"
+            except:
+                pass
+        
+        # Якщо перший метод не спрацював, використовуємо text-generation
+        if text_generation:
+            response = text_generation(question, max_length=150, num_return_sequences=1)
+            if response:
+                return response[0]['generated_text']
+        
+        # Якщо нічого не спрацювало - відповідь за замовчуванням
+        return generate_smart_response(question)
+    
+    except Exception as e:
+        logger.error(f"Помилка при генеруванні AI відповіді: {e}")
+        return generate_smart_response(question)
+
+def generate_smart_response(question):
+    """Генерування розумної відповіді без AI моделей"""
+    question_lower = question.lower()
+    
+    # Словник базових відповідей
+    responses = {
+        "привіт": "👋 Привіт! Я Ukrainian Helper - штучний інтелект компанії UkraineAI. Чим я можу вам допомогти?",
+        "як дела": "😊 Чудово! Готовий допомогти вам з будь-якими запитаннями. Що вас цікавить?",
+        "хто ти": "🤖 Я Ukrainian Helper - AI асистент бота UkraineAI. Я готовий відповідати на ваші запитання!",
+        "скільки": "🤔 Це залежить від контексту. Розкажіть більше деталей, і я спробую допомогти!",
+        "допомога": "📞 Я тут, щоб допомогти! Запитуйте що завгодно, і я постараюсь відповісти.",
+        "спасибо": "😊 Будь ласка! Рад був допомогти!",
+        "дякую": "😊 Будь ласка! Будь коли готовий допомогти!",
+    }
+    
+    # Пошук ключових слів у запитанні
+    for key, value in responses.items():
+        if key in question_lower:
+            return value
+    
+    # Якщо ключові слова не знайдені
+    default_responses = [
+        f"🤔 Цікаве запитання! \"{question}\" - це дуже цікаво. Я аналізую...",
+        f"💭 Ви запитали про: \"{question}\" - це чудове питання!",
+        f"📝 Ваше запитання: \"{question}\" - я над цим думаю...",
+        f"🧠 Розумію ваше запитання. Щодо \"{question}\", то це залежить від багатьох факторів.",
+    ]
+    
+    import random
+    return random.choice(default_responses)
 
 # Команда /help (тільки для власника)
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -153,7 +303,6 @@ async def setbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         identifier = context.args[0]
         amount = int(context.args[1])
         
-        # Пошук користувача за username або ID
         target_id = find_user_id(identifier)
         if not target_id:
             await update.message.reply_text("❌ Користувача не знайдено.")
@@ -204,6 +353,8 @@ async def givegenerator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user["generator_type"] = gen_type
     if gen_type == "3d":
         user["generator_expiry"] = (datetime.now() + timedelta(days=3)).isoformat()
+    else:
+        user["generator_expiry"] = None
     user_data.save_data()
     
     await update.message.reply_text(f"✅ Generator видано користувачу ({gen_type})")
@@ -227,6 +378,7 @@ async def takegenerator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = user_data.get_user(target_id)
     user["has_generator"] = False
     user["generator_type"] = None
+    user["generator_expiry"] = None
     user_data.save_data()
     
     await update.message.reply_text(f"✅ Generator забрано у користувача")
@@ -311,13 +463,11 @@ async def helpplus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Функція пошуку користувача
 def find_user_id(identifier):
     """Пошук ID користувача за username або ID"""
-    # Якщо це числовий ID
     try:
         return int(identifier.lstrip("@"))
     except ValueError:
         pass
     
-    # Пошук за username
     for user_id_str, user_info in user_data.users.items():
         if user_info.get("username", "").lower() == identifier.lstrip("@").lower():
             return int(user_id_str)
@@ -329,7 +479,46 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == "balance":
+    if query.data == "ask_ai":
+        user = user_data.get_user(query.from_user.id)
+        has_generator = user["has_generator"]
+        has_plus = user["has_plus"]
+        
+        # Перевірка терміну дії підписок
+        if has_generator and user.get("generator_type") == "3d":
+            expiry = user.get("generator_expiry")
+            if expiry:
+                expiry_date = datetime.fromisoformat(expiry)
+                if datetime.now() > expiry_date:
+                    user["has_generator"] = False
+                    user["generator_expiry"] = None
+                    user_data.save_data()
+                    has_generator = False
+        
+        if has_plus and user.get("plus_expiry"):
+            expiry_date = datetime.fromisoformat(user["plus_expiry"])
+            if datetime.now() > expiry_date:
+                user["has_plus"] = False
+                user["plus_expiry"] = None
+                user_data.save_data()
+                has_plus = False
+        
+        if has_generator or has_plus:
+            await query.edit_message_text("💬 Напишіть своє запитання, і я вам відповім!\n\nПросто пишіть в чат 👇")
+        else:
+            keyboard = [
+                [InlineKeyboardButton(f"🎯 Generator", callback_data="buy_generator_direct")],
+                [InlineKeyboardButton(f"💎 Plus", callback_data="buy_plus_direct")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await query.edit_message_text(
+                f"❌ Потрібна підписка для AI!\n\n"
+                f"🎯 Generator: {GENERATOR_COST:,} HelpCoins (на 3 дні)\n"
+                f"💎 Plus: {PLUS_COST:,} HelpCoins (на {PLUS_DURATION} днів)",
+                reply_markup=reply_markup
+            )
+    
+    elif query.data == "balance":
         user = user_data.get_user(query.from_user.id)
         await query.edit_message_text(f"💰 Ваш баланс: {user['balance']:,} HelpCoins")
     
@@ -347,7 +536,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     elif query.data == "do_exchange":
-        # Тут повинна бути логіка роботи зі Telegram Stars API
         await query.edit_message_text("✅ Обмін зірок включено в підписці Generator")
     
     elif query.data == "subscriptions":
@@ -362,30 +550,55 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "sub_generator":
         user = user_data.get_user(query.from_user.id)
         if user["has_generator"]:
-            await query.edit_message_text("✅ Ви маєте доступ до Generator!\n\n💰 Вартість: {GENERATOR_COST:,} HelpCoins")
+            gen_type = user.get("generator_type", "unknown")
+            if gen_type == "3d" and user.get("generator_expiry"):
+                expiry_date = datetime.fromisoformat(user["generator_expiry"])
+                days_left = (expiry_date - datetime.now()).days
+                await query.edit_message_text(f"✅ Ви маєте Generator!\n\n🎯 Тип: {gen_type}\nДнів залишилось: {days_left}")
+            else:
+                await query.edit_message_text(f"✅ Ви маєте постійний Generator!")
         else:
-            keyboard = [[InlineKeyboardButton(f"🎯 Купити за {GENERATOR_COST:,} HelpCoins", callback_data="buy_generator")]]
+            keyboard = [[InlineKeyboardButton(f"🎯 Купити за {GENERATOR_COST:,} HelpCoins", callback_data="buy_generator_direct")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(
                 f"🎯 GENERATOR\n\n"
-                f"Генерація зображень та відео за текстом\n\n"
-                f"Вартість: {GENERATOR_COST:,} HelpCoins",
+                f"🤖 AI асистент + Генерація контенту\n\n"
+                f"Вартість: {GENERATOR_COST:,} HelpCoins на 3 дні",
                 reply_markup=reply_markup
             )
     
     elif query.data == "sub_plus":
         user = user_data.get_user(query.from_user.id)
         if user["has_plus"]:
-            await query.edit_message_text("✅ Ви маєте Plus!")
+            expiry = user.get("plus_expiry")
+            if expiry:
+                expiry_date = datetime.fromisoformat(expiry)
+                days_left = (expiry_date - datetime.now()).days
+                await query.edit_message_text(f"✅ Ви маєте Plus!\n\nДнів залишилось: {days_left}")
+            else:
+                await query.edit_message_text("✅ Ви маєте постійний Plus!")
         else:
-            keyboard = [[InlineKeyboardButton(f"💎 Купити Plus за {PLUS_COST:,} HelpCoins", callback_data="buy_plus")]]
+            keyboard = [[InlineKeyboardButton(f"💎 Купити Plus за {PLUS_COST:,} HelpCoins", callback_data="buy_plus_direct")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(
                 f"💎 PLUS\n\n"
+                f"🤖 Безліміт AI запитань\n\n"
                 f"Тривалість: {PLUS_DURATION} днів\n\n"
                 f"Вартість: {PLUS_COST:,} HelpCoins",
                 reply_markup=reply_markup
             )
+    
+    elif query.data == "buy_generator_direct":
+        user = user_data.get_user(query.from_user.id)
+        if user["balance"] >= GENERATOR_COST:
+            user["has_generator"] = True
+            user["generator_type"] = "3d"
+            user["generator_expiry"] = (datetime.now() + timedelta(days=3)).isoformat()
+            user["balance"] -= GENERATOR_COST
+            user_data.save_data()
+            await query.edit_message_text("✅ Generator активовано на 3 дні!")
+        else:
+            await query.edit_message_text(f"❌ Недостатньо коштів!\n\nПотрібно: {GENERATOR_COST:,} HelpCoins\nЄ: {user['balance']:,} HelpCoins")
     
     elif query.data == "buy_generator":
         user = user_data.get_user(query.from_user.id)
@@ -398,6 +611,17 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("✅ Generator активовано на 3 дні!")
         else:
             await query.edit_message_text(f"❌ Недостатньо коштів!\n\nПотрібно: {GENERATOR_COST:,} HelpCoins\nЄ: {user['balance']:,} HelpCoins")
+    
+    elif query.data == "buy_plus_direct":
+        user = user_data.get_user(query.from_user.id)
+        if user["balance"] >= PLUS_COST:
+            user["has_plus"] = True
+            user["plus_expiry"] = (datetime.now() + timedelta(days=PLUS_DURATION)).isoformat()
+            user["balance"] -= PLUS_COST
+            user_data.save_data()
+            await query.edit_message_text(f"✅ Plus активовано на {PLUS_DURATION} днів!")
+        else:
+            await query.edit_message_text(f"❌ Недостатньо коштів!\n\nПотрібно: {PLUS_COST:,} HelpCoins\nЄ: {user['balance']:,} HelpCoins")
     
     elif query.data == "buy_plus":
         user = user_data.get_user(query.from_user.id)
@@ -421,11 +645,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💰 Баланс: {user['balance']:,} HelpCoins\n"
             f"⭐ Зірок: {user['stars']}\n"
             f"🎯 Generator: {generator_status}\n"
-            f"💎 Plus: {plus_status}"
+            f"💎 Plus: {plus_status}\n"
+            f"🤖 AI запитань: {user['ai_requests']}"
         )
     
     elif query.data == "back":
         keyboard = [
+            [InlineKeyboardButton("💬 Запитати AI", callback_data="ask_ai")],
             [InlineKeyboardButton("💰 Баланс", callback_data="balance")],
             [InlineKeyboardButton("⭐ Обміняти зірки", callback_data="exchange_stars")],
             [InlineKeyboardButton("🎁 Підписки", callback_data="subscriptions")],
@@ -448,6 +674,9 @@ def main():
     app.add_handler(CommandHandler("giveplus", giveplus))
     app.add_handler(CommandHandler("takeplus", takeplus))
     app.add_handler(CommandHandler("helpplus", helpplus))
+    
+    # Обробка текстових повідомлень (запитання до AI)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Callback кнопки
     app.add_handler(CallbackQueryHandler(button_callback))
